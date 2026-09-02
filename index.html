@@ -33,6 +33,9 @@
 <!-- Optional: EmailJS, used only if configured in EMAILJS_CONFIG below, for real password-reset emails -->
 <script src="https://cdn.jsdelivr.net/npm/@emailjs/browser@3/dist/email.min.js"></script>
 
+<!-- SheetJS, used to read the admin's Excel workbook for the "Bulk Import" screen -->
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+
 <style>
   html, body, #root { height: 100%; }
   body { margin: 0; }
@@ -199,6 +202,7 @@ function Icon({ name, size = 16, color = "currentColor", style }) {
     copy: <><rect x="9" y="9" width="12" height="12" rx="2" {...p} /><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1" {...p} /></>,
     archive: <><rect x="3" y="4" width="18" height="4" rx="1" {...p} /><path d="M5 8v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8" {...p} /><path d="M10 12h4" {...p} /></>,
     inbox: <><path d="M3 12h5l2 3h4l2-3h5" {...p} /><path d="M5.5 5h13L21 12v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-6z" {...p} /></>,
+    upload: <><path d="M12 16V4" {...p} /><path d="M6.5 9.5L12 4l5.5 5.5" {...p} /><path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" {...p} /></>,
   };
   const body = paths[name] || <circle cx="12" cy="12" r="9" {...p} />;
   const spin = name === "loader" ? { animation: "spin 1s linear infinite" } : {};
@@ -930,6 +934,7 @@ function AppRoot() {
     { id: "reports", label: "Reports", icon: "award" },
   ];
   if (isAdmin) NAV.push({ id: "teachers", label: "Teachers", icon: "user-plus" });
+  if (isAdmin) NAV.push({ id: "bulk-import", label: "Bulk Import", icon: "upload" });
 
   const visibleStudents = data.students.filter((s) => studentMatchesAssignments(s, assignments));
 
@@ -1012,6 +1017,7 @@ function AppRoot() {
           {tab === "evaluation" && <EvaluationView data={data} saveAll={saveAll} assignments={assignments} />}
           {tab === "reports" && <ReportsView data={data} visibleStudents={visibleStudents} />}
           {tab === "teachers" && isAdmin && <TeachersView auth={auth} saveAuth={saveAuth} />}
+          {tab === "bulk-import" && isAdmin && <BulkImportView data={data} saveAll={saveAll} showToast={showToast} />}
 
           {tab === "dashboard" && isAdmin && (
             <div className="mt-8 flex items-center gap-2">
@@ -1473,6 +1479,273 @@ function CategoryManager({ data, saveAll, onClose }) {
         <button onClick={onClose} className="px-3 py-2 rounded text-sm" style={{ border: `1px solid ${C.border}` }}>Done</button>
       </div>
     </Modal>
+  );
+}
+
+/* ================================================================== */
+/* Bulk Import — read an Excel workbook (Student data + Experiment      */
+/* data sheets) and add everything in a single saveAll() call, instead  */
+/* of one form submission per row.                                     */
+/* ================================================================== */
+function normHeader(h) {
+  return String(h == null ? "" : h).toLowerCase().replace(/[.\s_-]+/g, " ").trim();
+}
+const STUDENT_HEADER_MAP = {
+  "student id": "studentId", "id": "studentId", "roll no": "studentId", "roll number": "studentId",
+  "registration no": "studentId", "registration number": "studentId", "enrollment no": "studentId", "enrolment no": "studentId",
+  "student name": "name", "name": "name",
+  "course & branch": "course", "course and branch": "course", "course": "course", "branch": "course",
+  "programme": "course", "program": "course", "course code": "course",
+  "semester": "semester", "sem": "semester",
+  "section": "section", "sec": "section",
+};
+const EXPERIMENT_HEADER_MAP = {
+  "experiment title": "title", "title": "title", "experiment name": "title", "name": "title",
+  "category": "category",
+  "max marks": "maxMarks", "max. marks": "maxMarks", "maximum marks": "maxMarks", "marks": "maxMarks",
+};
+function matchCourseCode(raw) {
+  const v = String(raw == null ? "" : raw).trim();
+  if (!v) return null;
+  const upper = v.toUpperCase();
+  let hit = COURSES.find((c) => c.code.toUpperCase() === upper);
+  if (hit) return hit.code;
+  hit = COURSES.find((c) => new RegExp(`\\b${c.code}\\b`, "i").test(v));
+  if (hit) return hit.code;
+  hit = COURSES.find((c) => v.toLowerCase().includes(c.name.toLowerCase()) || c.name.toLowerCase().includes(v.toLowerCase()));
+  return hit ? hit.code : null;
+}
+function normalizeSemester(raw) {
+  const v = String(raw == null ? "" : raw).trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if (["I", "1", "1ST", "SEM1", "SEMESTERI", "SEMESTER1"].includes(v)) return "I";
+  if (["II", "2", "2ND", "SEM2", "SEMESTERII", "SEMESTER2"].includes(v)) return "II";
+  return null;
+}
+function normalizeSection(raw) {
+  const v = String(raw == null ? "" : raw).trim().toUpperCase();
+  return SECTIONS.includes(v) ? v : null;
+}
+// Turns a worksheet into { field: value } rows using the header-synonym map.
+// Ignores columns it doesn't recognise (e.g. "S.No.") and skips blank rows.
+function sheetToFieldRows(ws, headerMap) {
+  const grid = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "", raw: false });
+  if (!grid.length) return [];
+  const headerRow = grid[0];
+  const colToField = {};
+  headerRow.forEach((h, i) => { const f = headerMap[normHeader(h)]; if (f) colToField[i] = f; });
+  const rows = [];
+  for (let r = 1; r < grid.length; r++) {
+    const raw = grid[r];
+    if (!raw || raw.every((c) => String(c == null ? "" : c).trim() === "")) continue;
+    const fields = {};
+    Object.entries(colToField).forEach(([i, f]) => { fields[f] = raw[Number(i)]; });
+    rows.push(fields);
+  }
+  return rows;
+}
+function findSheet(workbook, nameContains) {
+  const name = workbook.SheetNames.find((n) => n.toLowerCase().includes(nameContains));
+  return name ? workbook.Sheets[name] : null;
+}
+
+function BulkImportView({ data, saveAll, showToast }) {
+  const [busy, setBusy] = useState(false);
+  const [parseErr, setParseErr] = useState("");
+  const [result, setResult] = useState(null); // { students: [...], experiments: [...] }
+  const [importing, setImporting] = useState(false);
+  const [done, setDone] = useState(null); // { studentsAdded, experimentsAdded }
+  const fileInputRef = useRef(null);
+
+  function reset() { setResult(null); setParseErr(""); setDone(null); if (fileInputRef.current) fileInputRef.current.value = ""; }
+
+  function handleFile(e) {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    setBusy(true); setParseErr(""); setResult(null); setDone(null);
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const wb = XLSX.read(ev.target.result, { type: "array" });
+        const studentSheet = findSheet(wb, "student") || wb.Sheets[wb.SheetNames[0]];
+        const expSheet = findSheet(wb, "experiment") || (wb.SheetNames[1] ? wb.Sheets[wb.SheetNames[1]] : null);
+
+        const existingStudentIds = new Set(data.students.map((s) => s.studentId.toLowerCase()));
+        const existingExpTitles = new Set(data.experiments.map((x) => x.title.toLowerCase()));
+        const existingCategories = new Set((data.categories && data.categories.length ? data.categories : CATEGORIES).map((c) => c.toLowerCase()));
+
+        const seenStudentIds = new Set();
+        const students = studentSheet ? sheetToFieldRows(studentSheet, STUDENT_HEADER_MAP).map((f, i) => {
+          const errors = [];
+          const studentId = String(f.studentId || "").trim();
+          const name = String(f.name || "").trim();
+          const courseCode = matchCourseCode(f.course);
+          const semester = normalizeSemester(f.semester);
+          const section = normalizeSection(f.section);
+          if (!studentId) errors.push("Missing Student ID");
+          if (!name) errors.push("Missing name");
+          if (!courseCode) errors.push(`Unrecognized programme "${f.course || ""}" (expected ${COURSES.map((c) => c.code).join("/")})`);
+          if (!semester) errors.push(`Unrecognized semester "${f.semester || ""}" (expected I or II)`);
+          if (!section) errors.push(`Unrecognized section "${f.section || ""}" (expected ${SECTIONS.join("/")})`);
+          let duplicate = false;
+          if (studentId) {
+            const key = studentId.toLowerCase();
+            if (existingStudentIds.has(key) || seenStudentIds.has(key)) duplicate = true;
+            else seenStudentIds.add(key);
+          }
+          return { row: i + 2, studentId, name, courseCode, semester, section, errors, duplicate };
+        }) : [];
+
+        const seenExpTitles = new Set();
+        const experiments = expSheet ? sheetToFieldRows(expSheet, EXPERIMENT_HEADER_MAP).map((f, i) => {
+          const errors = [];
+          const title = String(f.title || "").trim();
+          const category = String(f.category || "").trim();
+          if (!title) errors.push("Missing experiment title");
+          if (!category) errors.push("Missing category");
+          let maxMarks = Number(f.maxMarks);
+          if (!f.maxMarks || isNaN(maxMarks) || maxMarks <= 0) maxMarks = 10;
+          let duplicate = false;
+          if (title) {
+            const key = title.toLowerCase();
+            if (existingExpTitles.has(key) || seenExpTitles.has(key)) duplicate = true;
+            else seenExpTitles.add(key);
+          }
+          const newCategory = !!category && !existingCategories.has(category.toLowerCase());
+          return { row: i + 2, title, category, maxMarks, errors, duplicate, newCategory };
+        }) : [];
+
+        if (!studentSheet && !expSheet) setParseErr("Couldn't find a \"Student data\" or \"Experiment data\" sheet in this workbook.");
+        setResult({ students, experiments });
+      } catch (err) {
+        setParseErr("Couldn't read that file — please make sure it's a valid .xlsx file. (" + err.message + ")");
+      } finally {
+        setBusy(false);
+      }
+    };
+    reader.onerror = () => { setBusy(false); setParseErr("Couldn't read that file."); };
+    reader.readAsArrayBuffer(file);
+  }
+
+  function commitImport() {
+    if (!result) return;
+    setImporting(true);
+    const validStudents = result.students.filter((s) => s.errors.length === 0 && !s.duplicate);
+    const validExperiments = result.experiments.filter((e) => e.errors.length === 0 && !e.duplicate);
+
+    const newStudents = validStudents.map((s) => ({
+      studentId: s.studentId, name: s.name, courseCode: s.courseCode, semester: s.semester, section: s.section,
+      joined: new Date().toISOString().slice(0, 10), status: "active",
+    }));
+
+    let nextSrNo = data.experiments.length;
+    const newExperiments = validExperiments.map((e) => {
+      nextSrNo += 1;
+      return { id: `EXP${String(nextSrNo).padStart(2, "0")}`, srNo: nextSrNo, title: e.title, category: e.category, maxMarks: e.maxMarks, status: "active" };
+    });
+
+    const baseCategories = data.categories && data.categories.length ? data.categories : CATEGORIES;
+    const newCategoryNames = Array.from(new Set(validExperiments.filter((e) => e.newCategory).map((e) => e.category)));
+    const categories = [...baseCategories, ...newCategoryNames.filter((c) => !baseCategories.some((b) => b.toLowerCase() === c.toLowerCase()))];
+
+    saveAll({ ...data, students: [...data.students, ...newStudents], experiments: [...data.experiments, ...newExperiments], categories });
+    setDone({ studentsAdded: newStudents.length, experimentsAdded: newExperiments.length });
+    setImporting(false);
+    showToast(`Imported ${newStudents.length} students and ${newExperiments.length} experiments`);
+  }
+
+  function Summary({ label, rows }) {
+    const valid = rows.filter((r) => r.errors.length === 0 && !r.duplicate).length;
+    const dup = rows.filter((r) => r.duplicate).length;
+    const bad = rows.filter((r) => r.errors.length > 0).length;
+    return (
+      <div className="flex flex-wrap items-center gap-3 text-xs mb-2">
+        <span style={{ color: C.inkText }} className="font-semibold">{label}</span>
+        <Badge color={C.green} soft={C.greenSoft}>{valid} ready</Badge>
+        {dup > 0 && <Badge color={C.amber} soft={C.amberSoft}>{dup} duplicate — skipped</Badge>}
+        {bad > 0 && <Badge color={C.red} soft={C.redSoft}>{bad} error — skipped</Badge>}
+        <span style={{ color: C.slate }}>{rows.length} rows read</span>
+      </div>
+    );
+  }
+
+  function RowsTable({ kind, rows }) {
+    if (!rows.length) return <div className="text-xs mb-4" style={{ color: C.slate }}>No "{kind === "students" ? "Student data" : "Experiment data"}" rows found.</div>;
+    return (
+      <div className="rounded-lg overflow-hidden mb-5" style={{ border: `1px solid ${C.border}`, maxHeight: "260px", overflowY: "auto" }}>
+        <table className="w-full text-xs">
+          <thead style={{ position: "sticky", top: 0 }}>
+            <tr style={{ background: C.parchmentAlt, color: C.slate }}>
+              <th className="text-left px-2 py-1.5">Row</th>
+              {kind === "students" ? (
+                <><th className="text-left px-2 py-1.5">Student ID</th><th className="text-left px-2 py-1.5">Name</th><th className="text-left px-2 py-1.5">Prog.</th><th className="text-left px-2 py-1.5">Sem</th><th className="text-left px-2 py-1.5">Sec</th></>
+              ) : (
+                <><th className="text-left px-2 py-1.5">Title</th><th className="text-left px-2 py-1.5">Category</th><th className="text-left px-2 py-1.5">Max</th></>
+              )}
+              <th className="text-left px-2 py-1.5">Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.row} style={{ borderTop: `1px solid ${C.border}`, opacity: r.duplicate || r.errors.length ? 0.65 : 1 }}>
+                <td className="px-2 py-1.5" style={{ color: C.slate }}>{r.row}</td>
+                {kind === "students" ? (
+                  <><td className="px-2 py-1.5" style={{ fontFamily: "ui-monospace" }}>{r.studentId || "—"}</td><td className="px-2 py-1.5">{r.name || "—"}</td><td className="px-2 py-1.5">{r.courseCode || "—"}</td><td className="px-2 py-1.5">{r.semester || "—"}</td><td className="px-2 py-1.5">{r.section || "—"}</td></>
+                ) : (
+                  <><td className="px-2 py-1.5">{r.title || "—"}</td><td className="px-2 py-1.5">{r.category || "—"}{r.newCategory ? " (new)" : ""}</td><td className="px-2 py-1.5">{r.maxMarks}</td></>
+                )}
+                <td className="px-2 py-1.5">
+                  {r.errors.length > 0 ? <span style={{ color: C.red }}>{r.errors.join("; ")}</span>
+                    : r.duplicate ? <span style={{ color: C.amber }}>Already exists — skipped</span>
+                    : <span style={{ color: C.green }}>Ready</span>}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    );
+  }
+
+  const totalReady = result ? result.students.filter((s) => !s.errors.length && !s.duplicate).length + result.experiments.filter((e) => !e.errors.length && !e.duplicate).length : 0;
+
+  return (
+    <div>
+      <div className="rounded-lg p-4 mb-5" style={{ background: "#fff", border: `1px solid ${C.border}` }}>
+        <div style={{ color: C.inkText, fontFamily: "Georgia, serif" }} className="mb-1">Import students &amp; experiments from Excel</div>
+        <div className="text-xs mb-3" style={{ color: C.slate }}>
+          Upload one workbook with a "Student data" sheet (Student ID, Student Name, Course &amp; Branch, Semester, Section) and/or an
+          "Experiment data" sheet (Experiment Title, Category, Max. Marks). Everything is added in a single save — no need to add records one at a time.
+        </div>
+        <input ref={fileInputRef} type="file" accept=".xlsx,.xls,.csv" onChange={handleFile}
+          className="text-sm" style={{ color: C.inkText }} />
+        {busy && <div className="text-xs mt-2 flex items-center gap-1.5" style={{ color: C.slate }}><Icon name="loader" size={13} /> Reading file…</div>}
+        {parseErr && <div className="text-xs mt-2" style={{ color: C.red }}>{parseErr}</div>}
+      </div>
+
+      {result && !done && (
+        <div className="rounded-lg p-4 mb-5" style={{ background: "#fff", border: `1px solid ${C.border}` }}>
+          <Summary label="Students" rows={result.students} />
+          <RowsTable kind="students" rows={result.students} />
+          <Summary label="Experiments" rows={result.experiments} />
+          <RowsTable kind="experiments" rows={result.experiments} />
+          <div className="flex items-center gap-2">
+            <button onClick={commitImport} disabled={importing || totalReady === 0}
+              className="flex items-center gap-1.5 text-sm px-3 py-2 rounded" style={{ background: C.maroon, color: "#fff", opacity: importing || totalReady === 0 ? 0.6 : 1 }}>
+              <Icon name="save" size={14} /> {importing ? "Importing…" : `Import ${totalReady} record${totalReady === 1 ? "" : "s"}`}
+            </button>
+            <button onClick={reset} className="px-3 py-2 rounded text-sm" style={{ border: `1px solid ${C.border}` }}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {done && (
+        <div className="rounded-lg p-4" style={{ background: C.greenSoft, border: `1px solid ${C.border}` }}>
+          <div className="flex items-center gap-1.5 mb-1" style={{ color: C.green }}><Icon name="check-circle" size={15} /> Import complete</div>
+          <div className="text-sm" style={{ color: C.inkText }}>Added {done.studentsAdded} student{done.studentsAdded === 1 ? "" : "s"} and {done.experimentsAdded} experiment{done.experimentsAdded === 1 ? "" : "s"}.</div>
+          <button onClick={reset} className="mt-3 flex items-center gap-1.5 text-sm px-3 py-2 rounded" style={{ border: `1px solid ${C.border}` }}><Icon name="upload" size={14} /> Import another file</button>
+        </div>
+      )}
+    </div>
   );
 }
 
